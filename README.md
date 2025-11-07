@@ -83,6 +83,8 @@ build/libs/jadx-magic-strings-1.0.0.jar
      - **Method Candidates (Filtered)**: Table showing filtered method name candidates
      - **All Strings**: Table showing all extracted string constants
 
+![Magic Strings Plugin Example](docs/jadx-magic-strings-example.png)
+
 #### In JADX CLI
 
 The plugin runs automatically during decompilation, but there's no CLI interface to view the results. Use the GUI to see the extracted information.
