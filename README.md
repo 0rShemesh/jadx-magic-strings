@@ -112,14 +112,6 @@ The plugin runs automatically during decompilation, but there's no CLI interface
 - Method name detection uses heuristics and may produce false positives
 - Source file detection relies on strings containing file paths (not always present)
 
-### Technical Details
-
-- **Plugin ID**: `magic-strings`
-- **Pass Type**: `JadxAfterLoadPass` (runs after code is loaded)
-- **Data Storage**: Uses `IJadxAttribute` to store data in `RootNode`
-- **GUI Integration**: Adds menu action via `JadxGuiContext`
-- **Required JADX Version**: 1.5.2 or higher
-
 ### Troubleshooting
 
 **Plugin doesn't appear in menu:**
