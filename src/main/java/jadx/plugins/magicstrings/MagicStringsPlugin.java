@@ -14,6 +14,9 @@
  */
 package jadx.plugins.magicstrings;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import jadx.api.plugins.JadxPlugin;
 import jadx.api.plugins.JadxPluginContext;
 import jadx.api.plugins.JadxPluginInfo;
@@ -22,6 +25,7 @@ import jadx.plugins.magicstrings.gui.MagicStringsGui;
 import jadx.plugins.magicstrings.pass.ExtractStringsPass;
 
 public class MagicStringsPlugin implements JadxPlugin {
+	private static final Logger LOG = LoggerFactory.getLogger(MagicStringsPlugin.class);
 	public static final String PLUGIN_ID = "magic-strings";
 
 	@Override
@@ -35,7 +39,9 @@ public class MagicStringsPlugin implements JadxPlugin {
 
 	@Override
 	public void init(JadxPluginContext context) {
+		LOG.debug("Magic Strings Plugin: init() called - registering ExtractStringsPass");
 		context.addPass(new ExtractStringsPass());
+		LOG.info("Magic Strings Plugin started");
 
 		JadxGuiContext guiContext = context.getGuiContext();
 		if (guiContext != null) {

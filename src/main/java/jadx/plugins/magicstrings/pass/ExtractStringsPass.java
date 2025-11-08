@@ -1,8 +1,8 @@
 /**
  * Pass to extract string constants and analyze them for source files and method names.
  * 
- * This pass runs after code is loaded and scans all methods in all classes to:
- * - Extract string constants from instruction nodes (CONST_STR instructions)
+ * This pass runs during prepare phase and scans all methods in all classes to:
+ * - Extract string constants from opcodes.
  * - Detect source file references using regex patterns (matching .java, .kt, etc.)
  * - Identify method name candidates using heuristics and scoring algorithms
  * - Store all extracted information in MagicStringsData for GUI display
@@ -27,16 +27,13 @@ import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import jadx.api.JadxDecompiler;
+import jadx.api.plugins.input.data.ICodeReader;
+import jadx.api.plugins.input.insns.Opcode;
 import jadx.api.plugins.pass.JadxPassInfo;
-import jadx.api.plugins.pass.impl.OrderedJadxPassInfo;
-import jadx.api.plugins.pass.types.JadxAfterLoadPass;
+import jadx.api.plugins.pass.impl.SimpleJadxPassInfo;
+import jadx.api.plugins.pass.types.JadxPreparePass;
 import jadx.core.deobf.NameMapper;
-import jadx.core.dex.instructions.ConstStringNode;
-import jadx.core.dex.instructions.InsnType;
-import jadx.core.dex.nodes.BlockNode;
 import jadx.core.dex.nodes.ClassNode;
-import jadx.core.dex.nodes.InsnNode;
 import jadx.core.dex.nodes.MethodNode;
 import jadx.core.dex.nodes.RootNode;
 import jadx.plugins.magicstrings.data.MagicStringsData;
@@ -44,7 +41,7 @@ import jadx.plugins.magicstrings.data.MagicStringsData;
 /**
  * Pass to extract string constants and analyze them for source files and method names
  */
-public class ExtractStringsPass implements JadxAfterLoadPass {
+public class ExtractStringsPass implements JadxPreparePass {
 	private static final Logger LOG = LoggerFactory.getLogger(ExtractStringsPass.class);
 
 	// Configuration constants
@@ -175,17 +172,15 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 
 	@Override
 	public JadxPassInfo getInfo() {
-		return new OrderedJadxPassInfo(
-				"ExtractMagicStrings",
-				"Extract information from string constants")
-						.after("Deobfuscator");
+		return new SimpleJadxPassInfo("ExtractMagicStrings", "Extract information from string constants");
 	}
 
 	@Override
-	public void init(JadxDecompiler decompiler) {
+	public void init(RootNode root) {
+		LOG.debug("Magic Strings: ExtractStringsPass.init() ");
 		try {
-			RootNode root = decompiler.getRoot();
 			if (root == null) {
+				LOG.warn("Magic Strings: RootNode is null, aborting");
 				return;
 			}
 			LOG.info("Magic Strings: Initializing extraction pass");
@@ -197,7 +192,6 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 			long extractionTime = System.currentTimeMillis() - startTime;
 			LOG.info("Magic Strings: Found {} method candidates, processing filters...", data.getMethodCandidates().size());
 
-			// Process and filter candidates based on rarity
 			long filterStartTime = System.currentTimeMillis();
 			data.processFilteredCandidates();
 			long filterTime = System.currentTimeMillis() - filterStartTime;
@@ -206,8 +200,6 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 			LOG.info("Magic Strings: Complete. {} filtered candidates in {}ms (extraction: {}ms, filtering: {}ms)",
 					data.getFilteredCandidates().size(), totalTime, extractionTime, filterTime);
 		} catch (Exception e) {
-			// Don't fail the build if our plugin has issues
-			// Log error but continue
 			LOG.error("Magic Strings plugin error", e);
 		}
 	}
@@ -233,15 +225,7 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 				if (mth.isNoCode()) {
 					continue;
 				}
-				// Ensure method is loaded
-				if (!mth.isLoaded()) {
-					try {
-						mth.load();
-					} catch (Exception e) {
-						// Skip methods that fail to load
-						continue;
-					}
-				}
+				// No need to load method - code reader works without full decompilation
 				extractStringsFromMethod(cls, mth, data);
 				processedMethods++;
 			}
@@ -255,66 +239,31 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 	private void extractStringsFromMethod(ClassNode cls, MethodNode mth, MagicStringsData data) {
 		try {
 			String className = cls.getFullName();
-			// Use getFullId() instead of getFullName() to uniquely identify methods
-			// getFullId() includes signature: "className.methodName(Args)ReturnType"
-			// This allows us to distinguish between overloaded methods
 			String methodRef = mth.getMethodInfo().getFullId();
 			String methodName = mth.getName();
 
-			// Try to use blocks if available, otherwise use instructions array
-			List<BlockNode> blocks = mth.getBasicBlocks();
-			if (blocks != null && !blocks.isEmpty()) {
-				for (BlockNode block : blocks) {
-					if (block == null) {
-						continue;
-					}
-					List<InsnNode> blockInstructions = block.getInstructions();
-					if (blockInstructions != null) {
-						for (InsnNode insn : blockInstructions) {
-							if (insn != null) {
-								processStringInstruction(insn, methodRef, methodName, className, data);
-							}
+			ICodeReader codeReader = mth.getCodeReader();
+			if (codeReader != null) {
+				codeReader.visitInstructions(insn -> {
+					if (insn.getOpcode() == Opcode.CONST_STRING) {
+						insn.decode();
+						String str = insn.getIndexAsString();
+						
+						if (str != null && str.length() >= MIN_STRING_LENGTH) {
+							data.getAllStrings().add(
+									new MagicStringsData.StringInfo(str, methodRef, className));
+
+							checkSourceFile(str, methodRef, methodName, data);
+
+							checkMethodNames(str, methodRef, data);
 						}
 					}
-				}
-			} else {
-				// Fallback to instructions array
-				InsnNode[] instructions = mth.getInstructions();
-				if (instructions != null) {
-					for (InsnNode insn : instructions) {
-						if (insn != null) {
-							processStringInstruction(insn, methodRef, methodName, className, data);
-						}
-					}
-				}
+				});
 			}
 		} catch (Exception e) {
 			// Skip methods that cause issues
 			// Don't fail the entire pass
 		}
-	}
-
-	private void processStringInstruction(InsnNode insn, String methodRef, String methodName,
-			String className, MagicStringsData data) {
-		if (insn == null || insn.getType() != InsnType.CONST_STR) {
-			return;
-		}
-		ConstStringNode constStr = (ConstStringNode) insn;
-		String str = constStr.getString();
-
-		if (str == null || str.length() < MIN_STRING_LENGTH) {
-			return;
-		}
-
-		// Store string info
-		data.getAllStrings().add(
-				new MagicStringsData.StringInfo(str, methodRef, className));
-
-		// Check for source file references
-		checkSourceFile(str, methodRef, methodName, data);
-
-		// Check for method names
-		checkMethodNames(str, methodRef, data);
 	}
 
 	private void checkSourceFile(String str, String methodRef, String methodName, MagicStringsData data) {
@@ -394,22 +343,17 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 			}
 		}
 
-		// Limit number of candidates to process (performance optimization)
+		
 		if (candidatesWithScores.isEmpty()) {
 			return;
 		}
 
-		// Sort by score (descending) and keep only top candidates
 		candidatesWithScores.sort(Comparator.comparingInt(CandidateScore::getScore).reversed());
 
-		// Limit to top candidates per method (strict: only keep top 1-2)
 		int maxCandidates = Math.min(MAX_CANDIDATES_PER_METHOD, candidatesWithScores.size());
 
-		// Additional filtering: if we have multiple candidates, only keep those with score
-		// within 5 points of the top score (to avoid keeping weak candidates)
 		if (!candidatesWithScores.isEmpty() && maxCandidates > 1) {
 			int topScore = candidatesWithScores.get(0).getScore();
-			// Only keep candidates within 5 points of top score
 			for (int i = maxCandidates - 1; i >= 1; i--) {
 				if (candidatesWithScores.get(i).getScore() < topScore - 5) {
 					maxCandidates = i; // Reduce max candidates
@@ -445,9 +389,7 @@ public class ExtractStringsPass implements JadxAfterLoadPass {
 			return tokens;
 		}
 
-		// Check if string contains commas for splitting
 		if (str.contains(",")) {
-			// Split by commas and process each part
 			String[] parts = str.split(",");
 			for (String part : parts) {
 				if (part != null) {
