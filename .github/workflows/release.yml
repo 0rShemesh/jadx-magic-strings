@@ -3,6 +3,7 @@ name: Release
 on:
   release:
     types: [created]
+  workflow_dispatch:
 
 jobs:
   build-and-release:
@@ -28,9 +29,18 @@ jobs:
         run: ls -lh build/libs/
       
       - name: Upload JAR to release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
           files: build/libs/jadx-magic-strings-*.jar
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Upload JAR as artifact (manual run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jadx-magic-strings-jar
+          path: build/libs/jadx-magic-strings-*.jar
+          retention-days: 7
 
