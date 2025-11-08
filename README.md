@@ -35,7 +35,7 @@ jadx plugins --install "github:0rshemesh:jadx-magic-strings"
 
 3. **Install the plugin**:
    ```bash
-   jadx plugins --install-jar build/libs/jadx-magic-strings-1.0.0.jar
+   jadx plugins --install-jar build/libs/jadx-magic-strings-1.0.1.jar
    ```
 
    Or manually copy the JAR to JADX plugins directory:
@@ -52,7 +52,7 @@ The plugin can be built independently:
 
 The plugin JAR will be created at:
 ```
-build/libs/jadx-magic-strings-1.0.0.jar
+build/libs/jadx-magic-strings-1.0.1.jar
 ```
 
 **Requirements:**
