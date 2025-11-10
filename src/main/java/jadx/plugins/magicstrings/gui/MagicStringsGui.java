@@ -36,12 +36,15 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -63,6 +66,7 @@ import javax.swing.KeyStroke;
 import javax.swing.RowFilter;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
+import javax.swing.Timer;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
 import javax.swing.table.AbstractTableModel;
@@ -77,12 +81,9 @@ import org.slf4j.LoggerFactory;
 
 import jadx.api.JadxDecompiler;
 import jadx.api.JavaMethod;
-import jadx.api.data.ICodeData;
-import jadx.api.data.ICodeRename;
-import jadx.api.data.impl.JadxCodeData;
-import jadx.api.data.impl.JadxCodeRename;
-import jadx.api.data.impl.JadxNodeRef;
 import jadx.api.plugins.JadxPluginContext;
+import jadx.api.plugins.events.IJadxEvents;
+import jadx.api.plugins.events.types.NodeRenamedByUser;
 import jadx.api.plugins.gui.JadxGuiContext;
 import jadx.core.deobf.NameMapper;
 import jadx.core.dex.nodes.ClassNode;
@@ -92,6 +93,10 @@ import jadx.plugins.magicstrings.data.MagicStringsData;
 
 public class MagicStringsGui {
 	private static final Logger LOG = LoggerFactory.getLogger(MagicStringsGui.class);
+	private static final ThreadLocal<NavigationContext> NAVIGATION_CONTEXT = new ThreadLocal<>();
+	private static final AtomicBoolean RSYNTAX_HANDLER_REGISTERED = new AtomicBoolean(false);
+	private static final AtomicBoolean WRAP_WARNING_SHOWN = new AtomicBoolean(false);
+	private static Thread.UncaughtExceptionHandler previousExceptionHandler;
 
 	private final JadxPluginContext pluginContext;
 	// Cache for method names to avoid repeated expensive lookups
@@ -103,6 +108,7 @@ public class MagicStringsGui {
 
 	public MagicStringsGui(JadxPluginContext pluginContext) {
 		this.pluginContext = pluginContext;
+		registerEdtExceptionHandler();
 	}
 
 	public void init(JadxGuiContext guiContext) {
@@ -352,6 +358,7 @@ public class MagicStringsGui {
 	private void applyTreeFilter(JTree tree, String searchText) {
 		// Get stored original data - could be source files or top candidates
 		Object originalDataObj = tree.getClientProperty("originalData");
+		Object dataTypeObj = tree.getClientProperty("treeDataType");
 		
 		if (originalDataObj == null) {
 			return; // Can't filter without original data
@@ -359,19 +366,43 @@ public class MagicStringsGui {
 		
 		String searchLower = (searchText == null || searchText.trim().isEmpty()) ? null : searchText.trim().toLowerCase();
 		
-		// Check if it's source files data or top candidates data
-		if (originalDataObj instanceof Map && 
-				!((Map<?, ?>) originalDataObj).isEmpty() &&
-				((Map<?, ?>) originalDataObj).values().iterator().next() instanceof List) {
+		TreeDataType dataType = (dataTypeObj instanceof TreeDataType) ? (TreeDataType) dataTypeObj : null;
+		
+		if (dataType == TreeDataType.SOURCE_FILES && originalDataObj instanceof Map) {
 			@SuppressWarnings("unchecked")
-			Map<String, List<MagicStringsData.SourceFileReference>> sourceFileData = 
-				(Map<String, List<MagicStringsData.SourceFileReference>>) originalDataObj;
+			Map<String, List<MagicStringsData.SourceFileReference>> sourceFileData =
+					(Map<String, List<MagicStringsData.SourceFileReference>>) originalDataObj;
 			applySourceFileTreeFilter(tree, sourceFileData, searchLower);
-		} else if (originalDataObj instanceof Map) {
+			return;
+		}
+		
+		if (dataType == TreeDataType.TOP_CANDIDATES && originalDataObj instanceof Map) {
 			@SuppressWarnings("unchecked")
-			Map<String, List<TopCandidateWithSourceFile>> topCandidatesData = 
-				(Map<String, List<TopCandidateWithSourceFile>>) originalDataObj;
+			Map<String, List<TopCandidateWithSourceFile>> topCandidatesData =
+					(Map<String, List<TopCandidateWithSourceFile>>) originalDataObj;
 			applyTopCandidatesTreeFilter(tree, topCandidatesData, searchLower);
+			return;
+		}
+		
+		// Fallback for older dialogs where data type wasn't stored
+		if (originalDataObj instanceof Map && !((Map<?, ?>) originalDataObj).isEmpty()) {
+			Object firstValue = ((Map<?, ?>) originalDataObj).values().iterator().next();
+			if (firstValue instanceof List && !((List<?>) firstValue).isEmpty()) {
+				Object firstItem = ((List<?>) firstValue).get(0);
+				if (firstItem instanceof MagicStringsData.SourceFileReference) {
+					@SuppressWarnings("unchecked")
+					Map<String, List<MagicStringsData.SourceFileReference>> sourceFileData =
+							(Map<String, List<MagicStringsData.SourceFileReference>>) originalDataObj;
+					applySourceFileTreeFilter(tree, sourceFileData, searchLower);
+					return;
+				} else if (firstItem instanceof TopCandidateWithSourceFile) {
+					@SuppressWarnings("unchecked")
+					Map<String, List<TopCandidateWithSourceFile>> topCandidatesData =
+							(Map<String, List<TopCandidateWithSourceFile>>) originalDataObj;
+					applyTopCandidatesTreeFilter(tree, topCandidatesData, searchLower);
+					return;
+				}
+			}
 		}
 	}
 
@@ -526,6 +557,11 @@ public class MagicStringsGui {
 		tree.expandPath(parent);
 	}
 
+	private enum TreeDataType {
+		SOURCE_FILES,
+		TOP_CANDIDATES
+	}
+
 	private static class SourceFileTreeNodeData {
 		private final String filePath;
 		private final String methodRef;
@@ -633,6 +669,7 @@ public class MagicStringsGui {
 
 		// Store original data for filtering
 		tree.putClientProperty("originalData", data.getSourceFiles());
+		tree.putClientProperty("treeDataType", TreeDataType.SOURCE_FILES);
 
 		// Build tree with SourceFileTreeNodeData
 		for (Map.Entry<String, List<MagicStringsData.SourceFileReference>> entry : data.getSourceFiles().entrySet()) {
@@ -882,6 +919,7 @@ public class MagicStringsGui {
 
 		// Store original data for filtering
 		tree.putClientProperty("originalData", candidatesByFile);
+		tree.putClientProperty("treeDataType", TreeDataType.TOP_CANDIDATES);
 
 		// Build tree structure: Source File -> Methods with candidates
 		for (Map.Entry<String, List<TopCandidateWithSourceFile>> entry : candidatesByFile.entrySet()) {
@@ -1220,7 +1258,8 @@ public class MagicStringsGui {
 		});
 		popupMenu.add(renameItem);
 
-		JMenuItem renameAllItem = new JMenuItem("Rename all methods to candidates");
+		JMenuItem renameAllItem = new JMenuItem("Rename non-false-positive methods to candidates");
+		renameAllItem.setToolTipText("Renames only candidate names that don't look like false positives.");
 		renameAllItem.addActionListener(e -> {
 			// Get decompiler only when needed for renaming (requires ICodeData)
 			JadxDecompiler decompiler = pluginContext.getDecompiler();
@@ -1503,7 +1542,6 @@ public class MagicStringsGui {
 	private void renameMethod(JadxGuiContext guiContext, JadxDecompiler decompiler, String methodRef,
 			String newName) {
 		try {
-			// Validate and sanitize the new name
 			String sanitizedName = sanitizeMethodName(newName);
 			if (sanitizedName == null || sanitizedName.isEmpty()) {
 				JOptionPane.showMessageDialog(null,
@@ -1514,10 +1552,8 @@ public class MagicStringsGui {
 				return;
 			}
 
-			// Find the method
 			JavaMethod method = findMethodByRef(decompiler, methodRef);
 			if (method == null) {
-				// Try a more aggressive search as fallback
 				method = findMethodByRefFallback(decompiler, methodRef);
 				if (method == null) {
 					LOG.warn("Method not found for rename: {}", methodRef);
@@ -1529,32 +1565,23 @@ public class MagicStringsGui {
 				}
 			}
 
-			// Ensure codeData is initialized
-			ICodeData codeData = decompiler.getArgs().getCodeData();
-			JadxCodeData jadxCodeData;
-			if (codeData == null) {
-				jadxCodeData = new JadxCodeData();
-				jadxCodeData.setRenames(new java.util.ArrayList<>());
-				jadxCodeData.setComments(new java.util.ArrayList<>());
-				decompiler.getArgs().setCodeData(jadxCodeData);
-				codeData = jadxCodeData;
-			} else {
-				jadxCodeData = (JadxCodeData) codeData;
+			String currentName = method.getName();
+			if (sanitizedName.equals(currentName)) {
+				JOptionPane.showMessageDialog(null,
+						"Method already uses the requested name: " + sanitizedName,
+						"Rename Skipped", JOptionPane.INFORMATION_MESSAGE);
+				return;
 			}
 
-			// Ensure renames list is mutable
-			if (codeData.getRenames() == null || codeData.getRenames().isEmpty()) {
-				jadxCodeData.setRenames(new java.util.ArrayList<>());
+			if (!dispatchRenameEvent(guiContext, method, currentName, sanitizedName)) {
+				JOptionPane.showMessageDialog(null,
+						"Failed to apply rename for: " + methodRef + "\n\nSee logs for details.",
+						"Error", JOptionPane.ERROR_MESSAGE);
+				return;
 			}
 
-			// Create rename
-			ICodeRename rename = new JadxCodeRename(JadxNodeRef.forMth(method), sanitizedName);
-			codeData.getRenames().add(rename);
-
+			methodNameCache.put(methodRef, sanitizedName);
 			LOG.info("Renamed method {} to {}", methodRef, sanitizedName);
-
-			// Trigger reload
-			guiContext.reloadAllTabs();
 			JOptionPane.showMessageDialog(null, "Method renamed to: " + sanitizedName, "Success",
 					JOptionPane.INFORMATION_MESSAGE);
 		} catch (Exception e) {
@@ -1691,9 +1718,18 @@ public class MagicStringsGui {
 				final String finalMethodRef = methodRef;
 				// Navigate asynchronously to avoid blocking UI and handle errors gracefully
 				guiContext.uiRun(() -> {
+					NavigationContext previous = NAVIGATION_CONTEXT.get();
+					if (previous != null) {
+						previous.cancelExpiry();
+					}
+					NavigationContext navContext = new NavigationContext(guiContext, finalMethodNode, parentClass, finalMethodRef);
+					NAVIGATION_CONTEXT.set(navContext);
+					navContext.scheduleExpiry();
 					try {
 						guiContext.open((jadx.api.metadata.ICodeNodeRef) finalMethodNode);
 					} catch (Throwable t) {
+						navContext.cancelExpiry();
+						NAVIGATION_CONTEXT.remove();
 						// Handle navigation errors gracefully (e.g., empty code, tokenization errors)
 						// This can happen when method code is not loaded yet, is empty, or has tokenization bugs
 						LOG.debug("Method navigation failed (tokenization error or empty code), trying class navigation: {}",
@@ -1715,6 +1751,246 @@ public class MagicStringsGui {
 			}
 		} catch (Exception e) {
 			LOG.warn("Failed to navigate to method: {}", methodRef, e);
+		}
+	}
+
+	private void registerEdtExceptionHandler() {
+		if (RSYNTAX_HANDLER_REGISTERED.compareAndSet(false, true)) {
+			previousExceptionHandler = Thread.getDefaultUncaughtExceptionHandler();
+			Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+				if (handleRsSyntaxException(thread, throwable)) {
+					return;
+				}
+				if (previousExceptionHandler != null) {
+					previousExceptionHandler.uncaughtException(thread, throwable);
+				} else {
+					throwable.printStackTrace();
+				}
+			});
+		}
+	}
+
+	private static boolean handleRsSyntaxException(Thread thread, Throwable throwable) {
+		if (!isRsSyntaxLenMinusOne(throwable)) {
+			return false;
+		}
+		NavigationContext context = NAVIGATION_CONTEXT.get();
+		if (context != null) {
+			context.handleRsSyntaxException(throwable);
+		} else {
+			LOG.warn("RSyntaxTextArea len=-1 without active navigation context (thread: {})", thread.getName(), throwable);
+		}
+		return true;
+	}
+
+	private static boolean isRsSyntaxLenMinusOne(Throwable throwable) {
+		Throwable current = throwable;
+		while (current != null) {
+			String message = current.getMessage();
+			if (current instanceof IndexOutOfBoundsException && message != null && message.contains("len=-1")) {
+				for (StackTraceElement element : current.getStackTrace()) {
+					if ("org.fife.ui.rsyntaxtextarea.WrappedSyntaxView".equals(element.getClassName())) {
+						return true;
+					}
+				}
+			}
+			current = current.getCause();
+		}
+		return false;
+	}
+
+	private static void showWrapWarningOnce(JadxGuiContext guiContext, String methodRef) {
+		if (!WRAP_WARNING_SHOWN.compareAndSet(false, true)) {
+			return;
+		}
+		Runnable action = () -> {
+			String message = "Word wrap was disabled in the code viewer to avoid a known rendering bug while opening:\n"
+					+ methodRef + "\n\nYou can re-enable wrap from the View → Line wrap option once the upstream issue is fixed.";
+			JOptionPane.showMessageDialog(guiContext.getMainFrame(), message, "Magic Strings - Word Wrap Disabled",
+					JOptionPane.INFORMATION_MESSAGE);
+		};
+		if (SwingUtilities.isEventDispatchThread()) {
+			action.run();
+		} else {
+			SwingUtilities.invokeLater(action);
+		}
+	}
+
+	private static final class NavigationContext {
+		private final JadxGuiContext guiContext;
+		private final MethodNode methodNode;
+		private final ClassNode parentClass;
+		private final String methodRef;
+		private Timer expiryTimer;
+		private boolean retryAttempted;
+
+		NavigationContext(JadxGuiContext guiContext, MethodNode methodNode, ClassNode parentClass, String methodRef) {
+			this.guiContext = guiContext;
+			this.methodNode = methodNode;
+			this.parentClass = parentClass;
+			this.methodRef = methodRef;
+		}
+
+		void scheduleExpiry() {
+			cancelExpiry();
+			Timer timer = new Timer(700, e -> {
+				if (NAVIGATION_CONTEXT.get() == this) {
+					NAVIGATION_CONTEXT.remove();
+				}
+				cancelExpiry();
+			});
+			timer.setRepeats(false);
+			timer.start();
+			this.expiryTimer = timer;
+		}
+
+		void cancelExpiry() {
+			if (expiryTimer != null) {
+				expiryTimer.stop();
+				expiryTimer = null;
+			}
+		}
+
+		void handleRsSyntaxException(Throwable throwable) {
+			cancelExpiry();
+			NAVIGATION_CONTEXT.remove();
+			LOG.warn("Caught RSyntaxTextArea len=-1 while opening method {}", methodRef, throwable);
+			SwingUtilities.invokeLater(() -> {
+				LineWrapReflectionHelper.disableLineWrap(guiContext);
+				showWrapWarningOnce(guiContext, methodRef);
+				if (!retryAttempted) {
+					retryAttempted = true;
+					NavigationContext previous = NAVIGATION_CONTEXT.get();
+					if (previous != null) {
+						previous.cancelExpiry();
+					}
+					NAVIGATION_CONTEXT.set(this);
+					scheduleExpiry();
+					try {
+						guiContext.open((jadx.api.metadata.ICodeNodeRef) methodNode);
+						return;
+					} catch (Throwable retryEx) {
+						cancelExpiry();
+						NAVIGATION_CONTEXT.remove();
+						LOG.debug("Retry navigation after disabling wrap failed for {}", methodRef, retryEx);
+					}
+				}
+				openClassFallback();
+			});
+		}
+
+		private void openClassFallback() {
+			if (parentClass == null) {
+				return;
+			}
+			try {
+				guiContext.open((jadx.api.metadata.ICodeNodeRef) parentClass);
+			} catch (Throwable classEx) {
+				LOG.debug("Class navigation fallback failed for {}", methodRef, classEx);
+			}
+		}
+	}
+
+	private static final class LineWrapReflectionHelper {
+		private static final AtomicBoolean LOGGED_FAILURE = new AtomicBoolean(false);
+
+		private LineWrapReflectionHelper() {
+		}
+
+		static void disableLineWrap(JadxGuiContext guiContext) {
+			try {
+				Object mainFrame = guiContext.getMainFrame();
+				if (mainFrame == null) {
+					return;
+				}
+				Method getSettings = mainFrame.getClass().getMethod("getSettings");
+				Object settingsObj = getSettings.invoke(mainFrame);
+				if (settingsObj == null) {
+					return;
+				}
+				Method isWrap = settingsObj.getClass().getMethod("isCodeAreaLineWrap");
+				Boolean wrap = (Boolean) isWrap.invoke(settingsObj);
+				if (Boolean.FALSE.equals(wrap)) {
+					return;
+				}
+				Method setWrap = settingsObj.getClass().getMethod("setCodeAreaLineWrap", boolean.class);
+				setWrap.invoke(settingsObj, Boolean.FALSE);
+				applyLineWrapToOpenTabs(mainFrame, false);
+				try {
+					Method syncMethod = settingsObj.getClass().getMethod("sync");
+					syncMethod.invoke(settingsObj);
+				} catch (NoSuchMethodException ignored) {
+					// Older builds don't expose sync()
+				}
+				LOG.info("Disabled code viewer word wrap to avoid RSyntaxTextArea len=-1 issue");
+			} catch (Exception e) {
+				logReflectionError(e);
+			}
+		}
+
+		private static void applyLineWrapToOpenTabs(Object mainFrame, boolean wrap) throws Exception {
+			Method getTabbedPane = mainFrame.getClass().getMethod("getTabbedPane");
+			Object tabbedPane = getTabbedPane.invoke(mainFrame);
+			if (tabbedPane == null) {
+				return;
+			}
+			Method getTabs = tabbedPane.getClass().getMethod("getTabs");
+			@SuppressWarnings("unchecked")
+			List<Object> tabs = (List<Object>) getTabs.invoke(tabbedPane);
+			if (tabs == null) {
+				return;
+			}
+			for (Object contentPanel : tabs) {
+				applyLineWrapToContentPanel(contentPanel, wrap);
+			}
+		}
+
+		private static void applyLineWrapToContentPanel(Object contentPanel, boolean wrap) {
+			if (contentPanel == null) {
+				return;
+			}
+			try {
+				Method getCodeArea = contentPanel.getClass().getMethod("getCodeArea");
+				Object codeArea = getCodeArea.invoke(contentPanel);
+				setLineWrapOnCodeArea(codeArea, wrap);
+			} catch (NoSuchMethodException ignored) {
+				// Not a code content panel
+			} catch (Exception e) {
+				logReflectionError(e);
+			}
+			try {
+				Method getSmaliCodeArea = contentPanel.getClass().getMethod("getSmaliCodeArea");
+				Object smaliArea = getSmaliCodeArea.invoke(contentPanel);
+				setLineWrapOnCodeArea(smaliArea, wrap);
+			} catch (NoSuchMethodException ignored) {
+				// Panel doesn't expose smali area
+			} catch (Exception e) {
+				logReflectionError(e);
+			}
+		}
+
+		private static void setLineWrapOnCodeArea(Object codeArea, boolean wrap) {
+			if (codeArea == null) {
+				return;
+			}
+			try {
+				Method setLineWrap = codeArea.getClass().getMethod("setLineWrap", boolean.class);
+				setLineWrap.invoke(codeArea, wrap);
+				Method isVisible = codeArea.getClass().getMethod("isVisible");
+				boolean visible = (Boolean) isVisible.invoke(codeArea);
+				if (visible) {
+					Method repaint = codeArea.getClass().getMethod("repaint");
+					repaint.invoke(codeArea);
+				}
+			} catch (Exception e) {
+				logReflectionError(e);
+			}
+		}
+
+		private static void logReflectionError(Exception e) {
+			if (LOGGED_FAILURE.compareAndSet(false, true)) {
+				LOG.debug("Magic Strings: unable to adjust code viewer line wrap via reflection", e);
+			}
 		}
 	}
 
@@ -1874,6 +2150,16 @@ public class MagicStringsGui {
 		return sanitized;
 	}
 
+	private static boolean isLikelyFalsePositive(String currentName, String candidate) {
+		if (currentName == null || currentName.equals("?")
+				|| (currentName.startsWith("m") && currentName.length() <= 3)) {
+			return false;
+		}
+		String currentLower = currentName.toLowerCase();
+		String candidateLower = candidate.toLowerCase();
+		return !currentLower.contains(candidateLower) && !candidateLower.contains(currentLower);
+	}
+
 	private JavaMethod findMethodByRefFallback(JadxDecompiler decompiler, String methodRef) {
 		try {
 			// Search through all classes for a method with matching full name
@@ -1892,33 +2178,16 @@ public class MagicStringsGui {
 
 	private int renameAllMethods(JadxGuiContext guiContext, JadxDecompiler decompiler,
 			List<MagicStringsData.MethodCandidate> candidates) {
-		int count = 0;
+		int renamed = 0;
 		int failed = 0;
 		int invalid = 0;
-
-		// Ensure codeData is initialized
-		ICodeData codeData = decompiler.getArgs().getCodeData();
-		JadxCodeData jadxCodeData;
-		if (codeData == null) {
-			jadxCodeData = new JadxCodeData();
-			jadxCodeData.setRenames(new java.util.ArrayList<>());
-			jadxCodeData.setComments(new java.util.ArrayList<>());
-			decompiler.getArgs().setCodeData(jadxCodeData);
-			codeData = jadxCodeData;
-		} else {
-			jadxCodeData = (JadxCodeData) codeData;
-		}
-
-		// Ensure renames list is mutable
-		if (codeData.getRenames() == null || codeData.getRenames().isEmpty()) {
-			jadxCodeData.setRenames(new java.util.ArrayList<>());
-		}
+		int skipped = 0;
+		int falsePositive = 0;
 
 		for (MagicStringsData.MethodCandidate candidate : candidates) {
 			try {
 				JavaMethod method = findMethodByRef(decompiler, candidate.getMethodRef());
 				if (method == null) {
-					// Try fallback search
 					method = findMethodByRefFallback(decompiler, candidate.getMethodRef());
 				}
 				if (method == null) {
@@ -1926,38 +2195,92 @@ public class MagicStringsGui {
 					LOG.debug("Method not found for rename: {}", candidate.getMethodRef());
 					continue;
 				}
-
-				// Sanitize the candidate name
-				String newName = sanitizeMethodName(candidate.getCandidate());
-				if (newName == null || newName.isEmpty()) {
+				String sanitized = sanitizeMethodName(candidate.getCandidate());
+				if (sanitized == null || sanitized.isEmpty()) {
 					invalid++;
-					LOG.debug("Invalid method name for rename: '{}' (method: {})", candidate.getCandidate(),
-							candidate.getMethodRef());
+					LOG.debug("Invalid method name for rename: '{}' (method: {})",
+							candidate.getCandidate(), candidate.getMethodRef());
 					continue;
 				}
-
-				ICodeRename rename = new JadxCodeRename(JadxNodeRef.forMth(method), newName);
-				codeData.getRenames().add(rename);
-				count++;
+				String currentName = method.getName();
+				if (sanitized.equals(currentName)) {
+					skipped++;
+					continue;
+				}
+				if (isLikelyFalsePositive(currentName, sanitized)) {
+					falsePositive++;
+					continue;
+				}
+				if (dispatchRenameEvent(guiContext, method, currentName, sanitized)) {
+					methodNameCache.put(candidate.getMethodRef(), sanitized);
+					renamed++;
+				} else {
+					failed++;
+				}
 			} catch (Exception e) {
 				failed++;
 				LOG.warn("Failed to rename method: {}", candidate.getMethodRef(), e);
 			}
 		}
 
-		if (count > 0) {
-			guiContext.reloadAllTabs();
+		StringBuilder message = new StringBuilder(String.format("Renamed %d methods successfully.", renamed));
+		if (skipped > 0) {
+			message.append(String.format("\n%d methods already used the requested name.", skipped));
 		}
-
-		String message = String.format("Renamed %d methods successfully.", count);
-		if (failed > 0 || invalid > 0) {
-			message += String.format("\n%d methods could not be found.\n%d methods had invalid names.", failed,
-					invalid);
+		if (falsePositive > 0) {
+			message.append(String.format("\n%d candidates were skipped as likely false positives.", falsePositive));
 		}
-		JOptionPane.showMessageDialog(null, message, "Rename Complete", JOptionPane.INFORMATION_MESSAGE);
+		if (invalid > 0) {
+			message.append(String.format("\n%d candidates had invalid names.", invalid));
+		}
+		if (failed > 0) {
+			message.append(String.format("\n%d methods could not be renamed (see logs).", failed));
+		}
+		JOptionPane.showMessageDialog(null, message.toString(), "Rename Complete",
+				JOptionPane.INFORMATION_MESSAGE);
 
-		LOG.info("Rename all completed: {} successful, {} failed, {} invalid", count, failed, invalid);
-		return count;
+		LOG.info("Rename all completed: {} successful, {} skipped existing name, {} skipped false positive, {} invalid, {} failed",
+				renamed, skipped, falsePositive, invalid, failed);
+		return renamed;
+	}
+
+	private boolean dispatchRenameEvent(JadxGuiContext guiContext, JavaMethod method, String oldName, String newName) {
+		try {
+			javax.swing.JFrame mainFrame = guiContext.getMainFrame();
+			if (mainFrame == null) {
+				LOG.warn("Cannot dispatch rename event for {}: main frame not available", method.getFullName());
+				return false;
+			}
+			Method eventsMethod = mainFrame.getClass().getMethod("events");
+			Object eventsObj = eventsMethod.invoke(mainFrame);
+			if (!(eventsObj instanceof IJadxEvents)) {
+				LOG.warn("Cannot dispatch rename event for {}: unexpected events type {}",
+						method.getFullName(), eventsObj != null ? eventsObj.getClass().getName() : "null");
+				return false;
+			}
+			NodeRenamedByUser event = new NodeRenamedByUser(method.getCodeNodeRef(), oldName, newName);
+			IJadxEvents events = (IJadxEvents) eventsObj;
+			Runnable sendAction = () -> events.send(event);
+			if (SwingUtilities.isEventDispatchThread()) {
+				sendAction.run();
+			} else {
+				try {
+					SwingUtilities.invokeAndWait(sendAction);
+				} catch (InvocationTargetException e) {
+					Throwable cause = e.getCause() != null ? e.getCause() : e;
+					LOG.warn("Rename event dispatch failed for {}", method.getFullName(), cause);
+					return false;
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					LOG.warn("Rename event dispatch interrupted for {}", method.getFullName(), e);
+					return false;
+				}
+			}
+			return true;
+		} catch (Exception e) {
+			LOG.warn("Failed to dispatch rename event for {}", method.getFullName(), e);
+			return false;
+		}
 	}
 
 	private JPanel createAllStringsPanel(MagicStringsData data) {
@@ -2109,7 +2432,7 @@ public class MagicStringsGui {
 
 			// Get current method name (with caching)
 			String currentName = getMethodNameCached(methodRef);
-			boolean isFalsePositive = looksFalsePositive(currentName, candidateName);
+			boolean isFalsePositive = isLikelyFalsePositive(currentName, candidateName);
 
 			// Optimize raw string display
 			String fullRawStr = String.join(", ", rawStrings);
@@ -2178,15 +2501,6 @@ public class MagicStringsGui {
 			} catch (Exception e) {
 				return null;
 			}
-		}
-
-		private boolean looksFalsePositive(String currentName, String candidate) {
-			if (currentName == null || currentName.equals("?") || (currentName.startsWith("m") && currentName.length() <= 3)) {
-				return false;
-			}
-			String currentLower = currentName.toLowerCase();
-			String candidateLower = candidate.toLowerCase();
-			return !currentLower.contains(candidateLower) && !candidateLower.contains(currentLower);
 		}
 
 		@Override
